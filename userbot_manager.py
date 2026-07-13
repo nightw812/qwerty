@@ -7,12 +7,13 @@
 
 import os
 import asyncio
-import glob
 import random
 
 from telethon import TelegramClient
+from telethon.tl.types import Channel, Chat
 
 import config
+import spintax
 
 _clients: dict[str, TelegramClient] = {}
 
@@ -20,29 +21,6 @@ _clients: dict[str, TelegramClient] = {}
 def _session_path(session_key: str) -> str:
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
     return os.path.join(config.SESSIONS_DIR, f"user_{session_key}")
-
-
-def list_local_session_indices(user_id: int) -> list[int]:
-    """Ищет файлы сессий вида user_<user_id>_<index>.session на диске
-    (созданные локальным скриптом add_account_cli.py)."""
-    pattern = os.path.join(config.SESSIONS_DIR, f"user_{user_id}_*.session")
-    indices = []
-    for path in glob.glob(pattern):
-        name = os.path.basename(path)[: -len(".session")]  # user_<id>_<idx>
-        try:
-            idx = int(name.rsplit("_", 1)[-1])
-            indices.append(idx)
-        except ValueError:
-            continue
-    return sorted(indices)
-
-
-async def get_account_phone(session_key: str) -> str | None:
-    client = await get_client(session_key)
-    if not await client.is_user_authorized():
-        return None
-    me = await client.get_me()
-    return f"+{me.phone}" if me.phone else None
 
 
 async def get_client(session_key: str) -> TelegramClient:
@@ -78,6 +56,30 @@ async def sign_in_password(session_key: str, password: str):
     await client.sign_in(password=password)
 
 
+async def discard_client(session_key: str):
+    """
+    Полностью забывает клиента — используется, когда вход отменён или прерван
+    (например, отмена на этапе пароля 2FA). Без этого повторная попытка входа
+    на тот же account_index переиспользует того же "подвешенного" клиента и
+    падает со странной ошибкой вида "Two-steps verification is enabled...".
+    Log_out не вызываем — валидной авторизации там ещё нет, вызов log_out
+    на невалидной/недологиненной сессии сам может упасть с ошибкой.
+    """
+    client = _clients.pop(session_key, None)
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    path = _session_path(session_key) + ".session"
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 async def logout(session_key: str):
     client = await get_client(session_key)
     try:
@@ -86,13 +88,58 @@ async def logout(session_key: str):
         _clients.pop(session_key, None)
 
 
+def _can_post(entity) -> bool:
+    """
+    Определяет, может ли аккаунт писать в этот чат — используя поля, уже
+    присутствующие в объекте диалога (без дополнительных запросов к Telegram,
+    которые были и медленными, и ошибались на несуществующем атрибуте).
+    """
+    if isinstance(entity, Chat):
+        if getattr(entity, "left", False) or getattr(entity, "deactivated", False):
+            return False
+        if getattr(entity, "creator", False) or getattr(entity, "admin_rights", None):
+            return True
+        banned = getattr(entity, "default_banned_rights", None)
+        if banned and getattr(banned, "send_messages", False):
+            return False
+        return True
+
+    if isinstance(entity, Channel):
+        if getattr(entity, "left", False):
+            return False
+        if getattr(entity, "creator", False):
+            return True
+        admin_rights = getattr(entity, "admin_rights", None)
+        if admin_rights and getattr(admin_rights, "post_messages", False):
+            return True
+        if getattr(entity, "broadcast", False):
+            # Обычный (не админ) участник канала писать не может.
+            return False
+        # Супергруппа: смотрим персональные и общие для чата ограничения.
+        personal_banned = getattr(entity, "banned_rights", None)
+        if personal_banned and getattr(personal_banned, "send_messages", False):
+            return False
+        default_banned = getattr(entity, "default_banned_rights", None)
+        if default_banned and getattr(default_banned, "send_messages", False):
+            return False
+        return True
+
+    return True
+
+
 async def fetch_groups(session_key: str) -> list[dict]:
-    """Возвращает список групп/каналов, где состоит данный аккаунт."""
+    """
+    Возвращает список групп/каналов, где состоит данный аккаунт И где у него
+    есть право отправлять сообщения (каналы/группы без права постить пропускаются).
+    """
     client = await get_client(session_key)
     groups = []
     async for dialog in client.iter_dialogs():
-        if dialog.is_group or dialog.is_channel:
-            groups.append({"id": dialog.id, "name": dialog.name})
+        if not (dialog.is_group or dialog.is_channel):
+            continue
+        if not _can_post(dialog.entity):
+            continue
+        groups.append({"id": dialog.id, "name": dialog.name})
     return groups
 
 
@@ -101,18 +148,25 @@ async def broadcast(session_key: str, chat_ids: list[int], content: dict, delay_
     Рассылает контент только в группы из chat_ids (аккаунт должен уже там состоять).
 
     content = {
-        "type": "text" | "photo" | "photo_text",
-        "text": str | None,
+        "type": "text" | "photo" | "photo_text" | "forward",
+        "text": str | None,                 # может содержать спинтакс {a|b} и HTML-разметку
         "photo": путь к файлу изображения | None,
+        "forward_chat_id": int | None,       # для "forward"
+        "forward_message_id": int | None,    # для "forward"
     }
+    Текст резолвится ЗАНОВО перед каждой отправкой (спинтакс), чтобы сообщения
+    в разных группах отличались.
+
     delay_spec = {"min": float, "max": float} — пауза между отправками, секунды.
     Если min == max — пауза фиксированная, иначе каждая пауза выбирается случайно
     в этом диапазоне (с точностью до сотых секунды).
     """
     client = await get_client(session_key)
     content_type = content.get("type")
-    text = content.get("text")
+    text_template = content.get("text")
     photo = content.get("photo")
+    fwd_chat = content.get("forward_chat_id")
+    fwd_msg = content.get("forward_message_id")
 
     lo = delay_spec.get("min", 0)
     hi = delay_spec.get("max", lo)
@@ -123,11 +177,15 @@ async def broadcast(session_key: str, chat_ids: list[int], content: dict, delay_
     for chat_id in chat_ids:
         try:
             if content_type == "text":
-                await client.send_message(chat_id, text)
+                text = spintax.resolve(text_template)
+                await client.send_message(chat_id, text, parse_mode="html")
             elif content_type == "photo":
                 await client.send_file(chat_id, photo)
             elif content_type == "photo_text":
-                await client.send_file(chat_id, photo, caption=text)
+                text = spintax.resolve(text_template)
+                await client.send_file(chat_id, photo, caption=text, parse_mode="html")
+            elif content_type == "forward":
+                await client.forward_messages(chat_id, fwd_msg, from_peer=fwd_chat)
             else:
                 failed += 1
                 continue
