@@ -1,21 +1,39 @@
 """
 Главный файл. Меню:
  ▶️ старт | ⏹ стоп
+ 🕐 рассылка по времени | 📊 статистика
  👤 аккаунт | 👥 группы
  📝 контент | ⚙️ настройка
  🗓 расписание рассылок
+ ❓ FAQ
 
 Доступ только для ID из config.ALLOWED_USER_IDS.
 Каждый пользователь работает ТОЛЬКО со своими собственными Telegram-аккаунтами
 (можно добавить несколько). Если аккаунт один — рассылка всегда идёт через него.
 Если аккаунтов два и больше — какие из них реально рассылают, отмечается прямо
-в разделе «👤 аккаунт» галочками.
+в разделе «👤 аккаунт» галочками. Контент и часть настроек — на каждый аккаунт
+свои.
 """
 
 import asyncio
+import html
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+    MSK = ZoneInfo("Europe/Moscow")
+except Exception:
+    # На случай, если база часовых поясов недоступна (например, "голый" Windows
+    # без пакета tzdata) — используем фиксированное смещение. Россия не переходит
+    # на летнее/зимнее время с 2014 года, так что UTC+3 для MSK надёжно всегда.
+    MSK = timezone(timedelta(hours=3))
+
+
+def now_msk() -> datetime:
+    return datetime.now(MSK)
+
 from io import BytesIO
 
 import qrcode
@@ -33,8 +51,10 @@ from telethon.errors import (
 
 import config
 import storage
+import spintax
 import userbot_manager as ub
 import keyboards as kb
+from emoji_utils import emoji
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,9 +69,10 @@ class AccountStates(StatesGroup):
 
 
 class ContentStates(StatesGroup):
-    waiting_text = State()
-    waiting_photo = State()          # mode в FSM-данных: "photo" | "photo_text"
-    waiting_photo_caption = State()
+    waiting_text = State()           # data: account_index
+    waiting_photo = State()          # data: account_index, mode="photo"|"photo_text"
+    waiting_photo_caption = State()  # data: account_index, photo_path
+    waiting_forward = State()        # data: account_index
 
 
 class SettingsStates(StatesGroup):
@@ -62,12 +83,13 @@ class SettingsStates(StatesGroup):
 
 class ScheduleStates(StatesGroup):
     picking_days = State()                   # data: days=[int,...]
-    waiting_time = State()                   # data: days=[int,...]
+    waiting_start_time = State()             # data: days=[int,...]
+    waiting_end_time = State()               # data: days=[int,...], start="HH:MM"
 
 
 # ---------- безопасные edit_text/edit_reply_markup ----------
 
-async def safe_edit_text(message: Message, text: str, reply_markup=None):
+async def safe_edit_text(message: Message, text: str, reply_markup=None, parse_mode=None):
     """
     Обёртка над message.edit_text, которая не падает, если:
     - новое содержимое совпадает со старым (Telegram даёт ошибку "not modified");
@@ -75,7 +97,7 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None):
       сообщение удаляется и отправляется новое.
     """
     try:
-        await message.edit_text(text, reply_markup=reply_markup)
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             return
@@ -83,7 +105,7 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None):
             await message.delete()
         except TelegramBadRequest:
             pass
-        await message.answer(text, reply_markup=reply_markup)
+        await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 async def safe_edit_reply_markup(message: Message, reply_markup=None):
@@ -98,7 +120,6 @@ async def safe_edit_reply_markup(message: Message, reply_markup=None):
 # ---------- парсинг/форматирование ----------
 
 def parse_interval(text: str) -> int | None:
-    """Парсит строку вида H:MM:SS в количество секунд. Возвращает None, если формат неверный."""
     parts = text.strip().split(":")
     if len(parts) != 3:
         return None
@@ -123,14 +144,8 @@ def format_interval(total_seconds) -> str:
 
 
 def parse_delay_spec(text: str) -> dict | None:
-    """
-    Парсит паузу между отправками в группы.
-    "5"     -> фиксированная пауза 5 сек.
-    "5-6"   -> случайная пауза от 5 до 6 сек. (с точностью до сотых)
-    Дробные значения тоже допускаются: "5.5-6.2".
-    """
     text = text.strip().replace(",", ".")
-    if "-" in text[1:]:  # пропускаем возможный минус в самом начале (на случай опечатки)
+    if "-" in text[1:]:
         parts = text.split("-")
         if len(parts) != 2:
             return None
@@ -180,26 +195,51 @@ def parse_time_hhmm(text: str) -> str | None:
     return f"{h:02d}:{m:02d}"
 
 
-def content_preview(user: dict) -> str:
-    ctype = user.get("content_type")
+def _content_preview(acc: dict) -> str:
+    ctype = acc.get("content_type")
     if ctype == "text":
-        return f"текст: {user['content_text']}"
+        return f"текст: {acc['content_text']}"
     if ctype == "photo":
         return "фото (без текста)"
     if ctype == "photo_text":
-        return f"фото + текст: {user['content_text']}"
+        return f"фото + текст: {acc['content_text']}"
+    if ctype == "forward":
+        return "пересылаемое сообщение"
     return "(не задан)"
 
 
+def _groups_back_target(user: dict) -> str:
+    return "menu_main" if len(user["accounts"]) == 1 else "menu_groups"
+
+
+def _content_back_target(user: dict) -> str:
+    return "menu_main" if len(user["accounts"]) == 1 else "menu_content"
+
+
+def _extract_forward_origin(message: Message):
+    """Возвращает (chat_id, message_id) исходного сообщения, если пересылка
+    доступна для повторной пересылки, иначе (None, None)."""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None)
+        msg_id = getattr(origin, "message_id", None)
+        if chat is not None and msg_id is not None:
+            return chat.id, msg_id
+        return None, None
+    if message.forward_from_chat and message.forward_from_message_id:
+        return message.forward_from_chat.id, message.forward_from_message_id
+    return None, None
+
+
 # user_id -> список asyncio.Task (по одной на каждый рассылающий аккаунт)
-running_tasks: dict[int, list[asyncio.Task]] = {}
+running_tasks: dict[int, list] = {}
 
 # user_id -> {"client":..., "index":..., "task": asyncio.Task, "awaiting_password": bool}
 pending_qr_logins: dict[int, dict] = {}
 
 
-# def allowed(user_id: int) -> bool:
-#     return user_id in config.ALLOWED_USER_IDS
+def allowed(user_id: int) -> bool:
+    return user_id in config.ALLOWED_USER_IDS
 
 
 async def _canonical_phone(client) -> str:
@@ -209,45 +249,61 @@ async def _canonical_phone(client) -> str:
 
 # ---------- Доступ ----------
 
-# @router.message.middleware()
-# async def access_middleware(handler, event: Message, data):
-#     if not allowed(event.from_user.id):
-#         await event.answer("У вас нет доступа к этому боту. Обратитесь к администратору.")
-#         return
-#     return await handler(event, data)
+@router.message.middleware()
+async def access_middleware(handler, event: Message, data):
+    if not allowed(event.from_user.id):
+        await event.answer("У вас нет доступа к этому боту. Обратитесь к администратору.")
+        return
+    return await handler(event, data)
 
 
-# @router.callback_query.middleware()
-# async def access_middleware_cb(handler, event: CallbackQuery, data):
-#     if not allowed(event.from_user.id):
-#         await event.answer("Нет доступа", show_alert=True)
-#         return
-#     return await handler(event, data)
+@router.callback_query.middleware()
+async def access_middleware_cb(handler, event: CallbackQuery, data):
+    if not allowed(event.from_user.id):
+        await event.answer("Нет доступа", show_alert=True)
+        return
+    return await handler(event, data)
 
 
 # ---------- Главное меню ----------
 
+async def _abandon_pending_login(user_id: int, state: FSMContext):
+    """
+    Прерывает незавершённую попытку входа (QR или по номеру+коду) и сбрасывает
+    связанного Telethon-клиента. Без сброса клиента повторная попытка на тот же
+    account_index переиспользует "подвешенного" клиента и падает со странной
+    ошибкой вида "Two-steps verification is enabled..." — именно так это и
+    проявлялось при отмене входа на этапе пароля 2FA.
+    """
+    pending = pending_qr_logins.pop(user_id, None)
+    if pending:
+        if not pending["task"].done():
+            pending["task"].cancel()
+        await ub.discard_client(storage.session_key(user_id, pending["index"]))
+
+    data = await state.get_data()
+    account_index = data.get("account_index")
+    if account_index is not None:
+        await ub.discard_client(storage.session_key(user_id, account_index))
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Меню:", reply_markup=kb.main_menu())
+    await message.answer(f"{emoji('circle')} Меню:", reply_markup=kb.main_menu(), parse_mode="HTML")
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    await _abandon_pending_login(message.from_user.id, state)
     await state.clear()
-    pending = pending_qr_logins.pop(message.from_user.id, None)
-    if pending and not pending["task"].done():
-        pending["task"].cancel()
     await message.answer("Отменено.", reply_markup=kb.main_menu())
 
 
 @router.callback_query(F.data == "menu_main")
 async def cb_menu_main(call: CallbackQuery, state: FSMContext):
+    await _abandon_pending_login(call.from_user.id, state)
     await state.clear()
-    pending = pending_qr_logins.pop(call.from_user.id, None)
-    if pending and not pending["task"].done():
-        pending["task"].cancel()
-    await safe_edit_text(call.message, "Меню:", reply_markup=kb.main_menu())
+    await safe_edit_text(call.message, f"{emoji('circle')} Меню:", reply_markup=kb.main_menu(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "noop")
@@ -255,10 +311,32 @@ async def cb_noop(call: CallbackQuery):
     await call.answer()
 
 
-# ---------- Аккаунт (несколько на пользователя) ----------
+# ---------- Статистика ----------
+
+@router.callback_query(F.data == "menu_statistics")
+async def cb_menu_statistics(call: CallbackQuery):
+    user = storage.get_user_data(call.from_user.id)
+    accounts = user["accounts"]
+    total_groups = sum(len(a["groups"]) for a in accounts)
+    total_sent = sum(a.get("stat_sent", 0) for a in accounts)
+    total_errors = sum(a.get("stat_errors", 0) for a in accounts)
+    tasks = running_tasks.get(call.from_user.id, [])
+    running = any(not t.done() for t in tasks) or user.get("schedule_enabled", False)
+    status = "включена" if running else "остановлена"
+    text = (
+        f"{emoji('circle')} статистика\n\n"
+        f"акк {len(accounts)} · групп {total_groups}\n\n"
+        f"✓ отправлено {total_sent}\n"
+        f"✗ ошибки {total_errors}\n\n"
+        f"○ ({status})"
+    )
+    await safe_edit_text(call.message, text, reply_markup=kb.back_button("menu_main"), parse_mode="HTML")
 
 @router.callback_query(F.data == "menu_account")
 async def cb_menu_account(call: CallbackQuery):
+    if _bot_running(call.from_user.id):
+        await call.answer("Сначала выключите бота (⏹ стоп).", show_alert=True)
+        return
     user = storage.get_user_data(call.from_user.id)
     if user["accounts"]:
         if len(user["accounts"]) == 1:
@@ -281,8 +359,10 @@ async def cb_account_add(call: CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
 
     old = pending_qr_logins.pop(user_id, None)
-    if old and not old["task"].done():
-        old["task"].cancel()
+    if old:
+        if not old["task"].done():
+            old["task"].cancel()
+        await ub.discard_client(storage.session_key(user_id, old["index"]))
 
     account_index = storage.next_account_index(user_id)
     key = storage.session_key(user_id, account_index)
@@ -305,8 +385,6 @@ async def _send_qr(bot: Bot, chat_id: int, url: str, caption: str):
 
 
 async def _finish_login(user_id: int, account_index: int, key: str, client, bot: Bot, chat_id: int):
-    """Общая логика после успешной авторизации: проверка реестра номеров,
-    добавление аккаунта либо отказ + автоматический выход, если номер уже был в базе."""
     phone = await _canonical_phone(client)
     if storage.is_phone_registered(phone):
         try:
@@ -334,13 +412,14 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
     msg = None
     try:
         if user_id not in pending_qr_logins:
-            return  # отменено пользователем
+            return
         qr = await client.qr_login()
         msg = await _send_qr(bot, chat_id, qr.url, caption)
         try:
             await qr.wait(120)
         except asyncio.TimeoutError:
             pending_qr_logins.pop(user_id, None)
+            await ub.discard_client(key)
             try:
                 await bot.delete_message(chat_id, msg.message_id)
             except Exception:
@@ -365,6 +444,7 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
             return
     except Exception as e:
         pending_qr_logins.pop(user_id, None)
+        await ub.discard_client(key)
         await bot.send_message(chat_id, f"Ошибка входа: {e}")
         return
 
@@ -393,8 +473,10 @@ async def process_qr_password(message: Message):
 @router.callback_query(F.data == "account_add_phone")
 async def cb_account_add_phone(call: CallbackQuery, state: FSMContext):
     old = pending_qr_logins.pop(call.from_user.id, None)
-    if old and not old["task"].done():
-        old["task"].cancel()
+    if old:
+        if not old["task"].done():
+            old["task"].cancel()
+        await ub.discard_client(storage.session_key(call.from_user.id, old["index"]))
     await safe_edit_text(
         call.message,
         "Введите номер телефона аккаунта, который хотите добавить, "
@@ -504,17 +586,29 @@ async def cb_account_remove(call: CallbackQuery):
 # ---------- Группы (у каждого аккаунта — свои, с постраничным списком) ----------
 
 async def _show_groups_menu(call: CallbackQuery, index: int):
+    user = storage.get_user_data(call.from_user.id)
     acc = storage.get_account(call.from_user.id, index)
+    names = [g["name"] for g in acc["groups"] if g["id"] in acc["selected"]]
+    if names:
+        pairs = [", ".join(names[i:i + 2]) for i in range(0, len(names), 2)]
+        list_block = "<blockquote>" + "\n".join(html.escape(p) for p in pairs) + "</blockquote>"
+    else:
+        list_block = "(группы для отправки не выбраны)"
+    text = (
+        f"{emoji('account')} Аккаунт: {acc['phone']}\n"
+        f"Загружено групп: {len(acc['groups'])}\nВыбрано: {len(acc['selected'])}\n\n"
+        f"{list_block}"
+    )
     await safe_edit_text(
-        call.message,
-        f"Аккаунт: {acc['phone']}\n"
-        f"Загружено групп: {len(acc['groups'])}\nВыбрано: {len(acc['selected'])}",
-        reply_markup=kb.groups_menu(index),
+        call.message, text, reply_markup=kb.groups_menu(index, _groups_back_target(user)), parse_mode="HTML"
     )
 
 
 @router.callback_query(F.data == "menu_groups")
 async def cb_menu_groups(call: CallbackQuery):
+    if _bot_running(call.from_user.id):
+        await call.answer("Сначала выключите бота (⏹ стоп).", show_alert=True)
+        return
     user = storage.get_user_data(call.from_user.id)
     accounts = user["accounts"]
     if not accounts:
@@ -550,11 +644,14 @@ async def cb_groups_load(call: CallbackQuery):
     if not await ub.is_authorized(key):
         await call.answer("Аккаунт не авторизован", show_alert=True)
         return
-    await call.answer("Загружаю список групп...")
+    await call.answer("Загружаю список групп (без прав на отправку — пропускаю)...")
     groups = await ub.fetch_groups(key)
     storage.update_account(call.from_user.id, index, groups=groups)
+    user = storage.get_user_data(call.from_user.id)
     await safe_edit_text(
-        call.message, f"Готово. Загружено: {len(groups)} групп(ы).", reply_markup=kb.groups_menu(index)
+        call.message,
+        f"Готово. Загружено: {len(groups)} групп(ы), в которые есть право писать.",
+        reply_markup=kb.groups_menu(index, _groups_back_target(user)),
     )
 
 
@@ -567,7 +664,7 @@ async def cb_groups_select(call: CallbackQuery):
         return
     await safe_edit_text(
         call.message,
-        f"Отметьте группы для рассылки (аккаунт {acc['phone']}):",
+        f"Отметьте группы для рассылки\nаккаунт ({acc['phone']}):",
         reply_markup=kb.groups_select_kb(index, acc["groups"], acc["selected"], page=0),
     )
 
@@ -626,53 +723,162 @@ async def cb_groups_reset(call: CallbackQuery):
     )
 
 
-# ---------- Контент (текст / фото / фото+текст) ----------
+# ---------- Контент (текст / фото / фото+текст / пересылка — на каждый аккаунт свой) ----------
 
-@router.callback_query(F.data == "menu_content")
-async def cb_menu_content(call: CallbackQuery):
+async def _show_content_menu(call: CallbackQuery, index: int):
     user = storage.get_user_data(call.from_user.id)
+    acc = storage.get_account(call.from_user.id, index)
     await safe_edit_text(
-        call.message, f"Текущий контент рассылки:\n\n{content_preview(user)}", reply_markup=kb.content_menu()
+        call.message,
+        f"Контент для {acc['phone']}:\n\n{_content_preview(acc)}",
+        reply_markup=kb.content_menu(index, _content_back_target(user)),
     )
 
 
-@router.callback_query(F.data == "content_set_text")
+@router.callback_query(F.data == "menu_content")
+async def cb_menu_content(call: CallbackQuery):
+    if _bot_running(call.from_user.id):
+        await call.answer("Сначала выключите бота (⏹ стоп).", show_alert=True)
+        return
+    user = storage.get_user_data(call.from_user.id)
+    accounts = user["accounts"]
+    if not accounts:
+        await safe_edit_text(
+            call.message,
+            "Сначала подключите аккаунт (раздел «👤 аккаунт»).",
+            reply_markup=kb.back_button("menu_main"),
+        )
+        return
+    if len(accounts) == 1:
+        idx = accounts[0]["index"]
+        storage.update_user_data(call.from_user.id, content_account=idx)
+        await _show_content_menu(call, idx)
+        return
+    await safe_edit_text(
+        call.message,
+        "Выберите аккаунт, чей контент настраиваем:",
+        reply_markup=kb.account_picker_kb(accounts, "content_menu", "menu_main"),
+    )
+
+
+@router.callback_query(F.data.startswith("content_menu_"))
+async def cb_content_menu_for_account(call: CallbackQuery):
+    index = int(call.data.rsplit("_", 1)[-1])
+    storage.update_user_data(call.from_user.id, content_account=index)
+    await _show_content_menu(call, index)
+
+
+@router.callback_query(F.data.startswith("content_set_text_"))
 async def cb_content_set_text(call: CallbackQuery, state: FSMContext):
-    await safe_edit_text(call.message, "Отправьте текст, который нужно разослать:", reply_markup=kb.cancel_button())
+    index = int(call.data.rsplit("_", 1)[-1])
+    await state.update_data(account_index=index)
+    await safe_edit_text(
+        call.message,
+        "Отправьте текст, который нужно разослать (форматирование Telegram — жирный, "
+        "курсив, цитата и т.д. — сохранится).\n\n"
+        "Поддерживается рандомизация: <code>{вариант1|вариант2}</code> — каждая "
+        "отправка выберет случайный вариант. Поддерживается вложенность: "
+        "<code>{A|{B|C}}</code>.",
+        reply_markup=kb.cancel_button(),
+        parse_mode="HTML",
+    )
     await state.set_state(ContentStates.waiting_text)
+
+
+def _cleanup_photo_if_unused(user_id: int, account_index: int, new_content_type: str):
+    """
+    Файл фото для аккаунта хранится под фиксированным именем
+    (media/user_<uid>_<idx>.jpg), поэтому при переходе photo/photo_text -> photo
+    он просто перезаписывается сам. А вот при переходе на text/forward файл
+    остаётся на диске без ссылки на него — эта функция удаляет его, и вызывается
+    ровно в момент, когда бот уже подтвердил (сохранил) новый источник контента,
+    а не раньше.
+    """
+    if new_content_type in ("photo", "photo_text"):
+        return
+    path = os.path.join(config.MEDIA_DIR, f"user_{user_id}_{account_index}.jpg")
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 @router.message(ContentStates.waiting_text)
 async def process_content_text(message: Message, state: FSMContext):
-    storage.update_user_data(
-        message.from_user.id, content_type="text", content_text=message.text, content_photo=None
+    text = message.html_text
+    if not spintax.validate(text):
+        await message.answer("В шаблоне не совпадает количество { и } — проверьте и пришлите ещё раз.")
+        return
+    data = await state.get_data()
+    storage.update_account(
+        message.from_user.id, data["account_index"],
+        content_type="text", content_text=text, content_photo=None,
+        content_forward_chat_id=None, content_forward_message_id=None,
     )
+    _cleanup_photo_if_unused(message.from_user.id, data["account_index"], "text")
     await state.clear()
     await message.answer("Текст сохранён ✅", reply_markup=kb.main_menu())
 
 
-@router.callback_query(F.data == "content_set_photo")
+@router.callback_query(F.data.startswith("content_set_photo_"))
 async def cb_content_set_photo(call: CallbackQuery, state: FSMContext):
+    index = int(call.data.rsplit("_", 1)[-1])
+    await state.update_data(account_index=index, mode="photo")
     await safe_edit_text(call.message, "Отправьте фото, которое нужно разослать:", reply_markup=kb.cancel_button())
-    await state.update_data(mode="photo")
     await state.set_state(ContentStates.waiting_photo)
 
 
-@router.callback_query(F.data == "content_set_photo_text")
-async def cb_content_set_photo_text(call: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("content_set_phototext_"))
+async def cb_content_set_phototext(call: CallbackQuery, state: FSMContext):
+    index = int(call.data.rsplit("_", 1)[-1])
+    await state.update_data(account_index=index, mode="photo_text")
     await safe_edit_text(
         call.message,
-        "Отправьте фото. Если сразу добавите подпись к фото — текст возьмётся из неё, "
-        "иначе я спрошу текст отдельным сообщением.",
+        "Отправьте фото. Если сразу добавите подпись к фото — текст возьмётся из неё "
+        "(можно с рандомизацией {a|b}), иначе я спрошу текст отдельным сообщением.",
         reply_markup=kb.cancel_button(),
     )
-    await state.update_data(mode="photo_text")
     await state.set_state(ContentStates.waiting_photo)
 
 
-async def _save_photo(message: Message, user_id: int) -> str:
+@router.callback_query(F.data.startswith("content_set_forward_"))
+async def cb_content_set_forward(call: CallbackQuery, state: FSMContext):
+    index = int(call.data.rsplit("_", 1)[-1])
+    await state.update_data(account_index=index)
+    await safe_edit_text(
+        call.message,
+        "Перешлите сюда (Forward) сообщение, которое нужно рассылать пересылкой.\n\n"
+        "⚠️ Если отправитель ограничил пересылку своих сообщений, источник "
+        "определить не получится — тогда используйте текст/фото вместо пересылки.",
+        reply_markup=kb.cancel_button(),
+    )
+    await state.set_state(ContentStates.waiting_forward)
+
+
+@router.message(ContentStates.waiting_forward)
+async def process_content_forward(message: Message, state: FSMContext):
+    chat_id, msg_id = _extract_forward_origin(message)
+    if chat_id is None or msg_id is None:
+        await message.answer(
+            "Не удалось определить источник пересылки. Перешлите другое сообщение "
+            "(из канала/группы, где пересылка не ограничена), либо используйте текст/фото."
+        )
+        return
+    data = await state.get_data()
+    storage.update_account(
+        message.from_user.id, data["account_index"],
+        content_type="forward", content_text=None, content_photo=None,
+        content_forward_chat_id=chat_id, content_forward_message_id=msg_id,
+    )
+    _cleanup_photo_if_unused(message.from_user.id, data["account_index"], "forward")
+    await state.clear()
+    await message.answer("Пересылаемое сообщение сохранено ✅", reply_markup=kb.main_menu())
+
+
+async def _save_photo(message: Message, user_id: int, account_index: int) -> str:
     os.makedirs(config.MEDIA_DIR, exist_ok=True)
-    path = os.path.join(config.MEDIA_DIR, f"user_{user_id}.jpg")
+    path = os.path.join(config.MEDIA_DIR, f"user_{user_id}_{account_index}.jpg")
     await message.bot.download(message.photo[-1], destination=path)
     return path
 
@@ -681,19 +887,28 @@ async def _save_photo(message: Message, user_id: int) -> str:
 async def process_content_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     mode = data.get("mode", "photo")
-    path = await _save_photo(message, message.from_user.id)
+    idx = data["account_index"]
+    path = await _save_photo(message, message.from_user.id, idx)
 
     if mode == "photo":
-        storage.update_user_data(
-            message.from_user.id, content_type="photo", content_text=None, content_photo=path
+        storage.update_account(
+            message.from_user.id, idx,
+            content_type="photo", content_text=None, content_photo=path,
+            content_forward_chat_id=None, content_forward_message_id=None,
         )
         await state.clear()
         await message.answer("Фото сохранено ✅", reply_markup=kb.main_menu())
         return
 
     if message.caption:
-        storage.update_user_data(
-            message.from_user.id, content_type="photo_text", content_text=message.caption, content_photo=path
+        caption = message.html_text
+        if not spintax.validate(caption):
+            await message.answer("В подписи не совпадает количество { и } — пришлите фото с подписью ещё раз.")
+            return
+        storage.update_account(
+            message.from_user.id, idx,
+            content_type="photo_text", content_text=caption, content_photo=path,
+            content_forward_chat_id=None, content_forward_message_id=None,
         )
         await state.clear()
         await message.answer("Фото и текст сохранены ✅", reply_markup=kb.main_menu())
@@ -711,9 +926,15 @@ async def process_content_photo_wrong_type(message: Message):
 
 @router.message(ContentStates.waiting_photo_caption)
 async def process_photo_caption(message: Message, state: FSMContext):
+    text = message.html_text
+    if not spintax.validate(text):
+        await message.answer("В шаблоне не совпадает количество { и } — пришлите текст ещё раз.")
+        return
     data = await state.get_data()
-    storage.update_user_data(
-        message.from_user.id, content_type="photo_text", content_text=message.text, content_photo=data["photo_path"]
+    storage.update_account(
+        message.from_user.id, data["account_index"],
+        content_type="photo_text", content_text=text, content_photo=data["photo_path"],
+        content_forward_chat_id=None, content_forward_message_id=None,
     )
     await state.clear()
     await message.answer("Фото и текст сохранены ✅", reply_markup=kb.main_menu())
@@ -744,6 +965,9 @@ async def _show_settings_menu(call: CallbackQuery):
 
 @router.callback_query(F.data == "menu_settings")
 async def cb_menu_settings(call: CallbackQuery):
+    if _bot_running(call.from_user.id):
+        await call.answer("Сначала выключите бота (⏹ стоп).", show_alert=True)
+        return
     await _show_settings_menu(call)
 
 
@@ -753,8 +977,6 @@ async def cb_settings_switch(call: CallbackQuery):
     storage.update_user_data(call.from_user.id, settings_account=index)
     await _show_settings_menu(call)
 
-
-# --- Интервал (для выбранного в настройках аккаунта) ---
 
 @router.callback_query(F.data == "settings_interval")
 async def cb_settings_interval(call: CallbackQuery):
@@ -795,8 +1017,8 @@ async def cb_settings_interval_once(call: CallbackQuery):
     if not acc["selected"]:
         await call.answer(f"Не настроена группа на номере — {acc['phone']}", show_alert=True)
         return
-    if not user["content_type"]:
-        await call.answer("Сначала задайте контент рассылки", show_alert=True)
+    if not acc["content_type"]:
+        await call.answer(f"Не настроен контент на номере — {acc['phone']}", show_alert=True)
         return
     await call.answer("Отправляю один раз...")
     asyncio.create_task(_send_once_for_account(call.from_user.id, idx, call.bot))
@@ -813,8 +1035,6 @@ async def process_interval(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"Интервал сохранён: {format_interval(seconds)} ✅", reply_markup=kb.main_menu())
 
-
-# --- Пауза между отправками в группы (случайная, для выбранного аккаунта) ---
 
 @router.callback_query(F.data == "settings_delay")
 async def cb_settings_delay(call: CallbackQuery):
@@ -856,8 +1076,6 @@ async def process_delay(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"Пауза сохранена: {format_delay_spec(spec)} ✅", reply_markup=kb.main_menu())
 
-
-# --- Пауза между аккаунтами (нужно 2+ аккаунта, отмеченных для рассылки) ---
 
 @router.callback_query(F.data == "settings_delay_between_accounts")
 async def cb_settings_delay_between_accounts(call: CallbackQuery):
@@ -913,7 +1131,7 @@ async def process_delay_between_accounts(message: Message, state: FSMContext):
     await message.answer(f"Пауза между аккаунтами сохранена: {value} сек. ✅", reply_markup=kb.main_menu())
 
 
-# ---------- Расписание рассылок (теперь в главном меню) ----------
+# ---------- Расписание рассылок (окно начало-конец, теперь в главном меню) ----------
 
 @router.callback_query(F.data == "menu_schedule")
 async def cb_menu_schedule(call: CallbackQuery):
@@ -922,10 +1140,11 @@ async def cb_menu_schedule(call: CallbackQuery):
     await safe_edit_text(
         call.message,
         f"Расписание рассылок. Статус: {status}\n\n"
-        f"Бот будет автоматически запускать рассылку в указанное время (по времени "
-        f"сервера, на котором запущен бот).\n\n"
-        f"Включается кнопкой ▶️ старт в главном меню (если расписание не пустое), "
-        f"выключается кнопкой ⏹ стоп.",
+        f"Для каждой записи задаётся окно времени: начало и конец. Пока текущее "
+        f"время внутри окна (и, если указаны дни — сегодня подходящий день), "
+        f"рассылка идёт автоматически; вне окна — останавливается сама.\n\n"
+        f"Включается кнопкой 🕐 «рассылка по времени» в главном меню, "
+        f"выключается кнопкой ⏹ стоп. Время — по МСК (Москва).",
         reply_markup=kb.schedule_menu(user["schedule"], user.get("schedule_enabled", False)),
     )
 
@@ -947,7 +1166,7 @@ async def cb_schedule_toggle_day(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     days = set(data.get("days", []))
     if suffix == "all":
-        days = set()  # пусто = "каждый день"
+        days = set()
     else:
         day = int(suffix)
         if day in days:
@@ -961,21 +1180,34 @@ async def cb_schedule_toggle_day(call: CallbackQuery, state: FSMContext):
 @router.callback_query(ScheduleStates.picking_days, F.data == "schedule_days_done")
 async def cb_schedule_days_done(call: CallbackQuery, state: FSMContext):
     await safe_edit_text(
-        call.message, "Введите время в формате ЧЧ:ММ (например 09:00):", reply_markup=kb.back_button("menu_schedule")
+        call.message,
+        "Введите время НАЧАЛА рассылки по МСК в формате ЧЧ:ММ (например 09:00):",
+        reply_markup=kb.back_button("menu_schedule"),
     )
-    await state.set_state(ScheduleStates.waiting_time)
+    await state.set_state(ScheduleStates.waiting_start_time)
 
 
-@router.message(ScheduleStates.waiting_time)
-async def process_schedule_time(message: Message, state: FSMContext):
+@router.message(ScheduleStates.waiting_start_time)
+async def process_schedule_start_time(message: Message, state: FSMContext):
     time_str = parse_time_hhmm(message.text)
     if time_str is None:
         await message.answer("Неверный формат. Пришлите время как ЧЧ:ММ, например 09:00")
         return
+    await state.update_data(start=time_str)
+    await message.answer("Теперь введите время ОКОНЧАНИЯ рассылки по МСК в формате ЧЧ:ММ (например 18:00):")
+    await state.set_state(ScheduleStates.waiting_end_time)
+
+
+@router.message(ScheduleStates.waiting_end_time)
+async def process_schedule_end_time(message: Message, state: FSMContext):
+    time_str = parse_time_hhmm(message.text)
+    if time_str is None:
+        await message.answer("Неверный формат. Пришлите время как ЧЧ:ММ, например 18:00")
+        return
     data = await state.get_data()
-    storage.add_schedule_entry(message.from_user.id, data.get("days", []), time_str)
+    storage.add_schedule_entry(message.from_user.id, data.get("days", []), data["start"], time_str)
     await state.clear()
-    await message.answer(f"Добавлено в расписание: {time_str} ✅", reply_markup=kb.main_menu())
+    await message.answer(f"Добавлено в расписание: {data['start']}–{time_str} ✅", reply_markup=kb.main_menu())
 
 
 @router.callback_query(F.data.startswith("schedule_remove_"))
@@ -987,31 +1219,86 @@ async def cb_schedule_remove(call: CallbackQuery):
     )
 
 
-# ---------- Рассылка (одновременно/со сдвигом с нескольких аккаунтов) ----------
+def _time_in_window(now_hhmm: str, start: str, end: str) -> bool:
+    if start <= end:
+        return start <= now_hhmm <= end
+    return now_hhmm >= start or now_hhmm <= end  # окно "через полночь"
+
+
+def _schedule_active_now(user: dict, now: datetime, hhmm: str) -> bool:
+    weekday = now.weekday()
+    for entry in user["schedule"]:
+        if entry["days"] and weekday not in entry["days"]:
+            continue
+        if _time_in_window(hhmm, entry["start"], entry["end"]):
+            return True
+    return False
+
+
+# ---------- Рассылка ----------
 
 def _eligible_broadcast_indices(user: dict) -> list[int]:
     result = []
     for idx in user["broadcast_accounts"]:
         acc = next((a for a in user["accounts"] if a["index"] == idx), None)
-        if acc and acc["selected"]:
+        if acc and acc["selected"] and acc["content_type"]:
             result.append(idx)
     return result
 
 
-async def _send_once_for_account(user_id: int, account_index: int, bot: Bot):
-    user = storage.get_user_data(user_id)
+async def _handle_dead_session(user_id: int, account_index: int, bot: Bot):
+    """
+    Аккаунт отключён от Telegram (сессия была завершена вручную через
+    приложение Telegram, в разделе "Устройства") — убираем его из профиля
+    полностью: чистим сохранённое фото, удаляем аккаунт (это же освобождает
+    номер в глобальной базе телефонов бота) и уведомляем владельца.
+    """
     acc = storage.get_account(user_id, account_index)
-    if not acc or not user["content_type"] or not acc["selected"]:
+    if not acc:
+        return
+    phone = acc["phone"]
+    photo_path = acc.get("content_photo")
+    if photo_path and os.path.exists(photo_path):
+        try:
+            os.remove(photo_path)
+        except OSError:
+            pass
+    key = storage.session_key(user_id, account_index)
+    try:
+        await ub.discard_client(key)
+    except Exception:
+        pass
+    storage.remove_account(user_id, account_index)
+    try:
+        await bot.send_message(
+            user_id,
+            f"⚠️ Бот отключён от Telegram на номере {phone} — сессия была "
+            f"завершена вручную через приложение Telegram (раздел «Устройства»). "
+            f"Аккаунт удалён из профиля бота, фото/текст для него очищены. "
+            f"При необходимости подключите аккаунт заново.",
+        )
+    except Exception:
+        pass
+
+
+async def _send_once_for_account(user_id: int, account_index: int, bot: Bot):
+    acc = storage.get_account(user_id, account_index)
+    if not acc or not acc["content_type"] or not acc["selected"]:
         return
     content = {
-        "type": user["content_type"],
-        "text": user["content_text"],
-        "photo": user["content_photo"],
+        "type": acc["content_type"],
+        "text": acc["content_text"],
+        "photo": acc["content_photo"],
+        "forward_chat_id": acc["content_forward_chat_id"],
+        "forward_message_id": acc["content_forward_message_id"],
     }
     key = storage.session_key(user_id, account_index)
     try:
-        if await ub.is_authorized(key):
-            await ub.broadcast(key, acc["selected"], content, acc["delay"])
+        if not await ub.is_authorized(key):
+            await _handle_dead_session(user_id, account_index, bot)
+            return
+        sent, failed = await ub.broadcast(key, acc["selected"], content, acc["delay"])
+        storage.add_stats(user_id, account_index, sent, failed)
     except Exception as e:
         logger.error(f"Ошибка рассылки для {user_id}, аккаунт {account_index}: {e}")
         try:
@@ -1034,63 +1321,131 @@ async def _account_broadcast_loop(user_id: int, account_index: int, start_offset
         await asyncio.sleep(interval)
 
 
+def _launch_tasks(user_id: int, indices: list[int], bot: Bot):
+    user = storage.get_user_data(user_id)
+    delay_between_accounts = user.get("delay_between_accounts", 0) if len(indices) >= 2 else 0
+    tasks = []
+    for i, idx in enumerate(indices):
+        offset = i * delay_between_accounts
+        tasks.append(asyncio.create_task(_account_broadcast_loop(user_id, idx, offset, bot)))
+    running_tasks[user_id] = tasks
+    return tasks
+
+
+def _is_running(user_id: int) -> bool:
+    tasks = running_tasks.get(user_id, [])
+    return any(not t.done() for t in tasks)
+
+
+def _bot_running(user_id: int) -> bool:
+    """Активна ли рассылка (обычная или по расписанию) — пока это так,
+    настройки/аккаунт/группы/контент менять нельзя."""
+    user = storage.get_user_data(user_id)
+    return _is_running(user_id) or user.get("schedule_enabled", False)
+
+
 @router.callback_query(F.data == "broadcast_start")
 async def cb_broadcast_start(call: CallbackQuery):
     user_id = call.from_user.id
     user = storage.get_user_data(user_id)
 
-    # Если настроено расписание — старт включает именно его, а не немедленную рассылку.
-    if user["schedule"]:
-        storage.update_user_data(user_id, schedule_enabled=True)
-        await safe_edit_text(
-            call.message,
-            "🗓 Расписание запущено. Рассылка будет выполняться автоматически по "
-            "заданным дням и времени. Нажмите ⏹ стоп, чтобы остановить.",
-            reply_markup=kb.main_menu(),
-        )
+    if user.get("schedule_enabled"):
+        await call.answer("Сначала выключите рассылку по расписанию (⏹ стоп).", show_alert=True)
         return
 
     broadcast_idx = user["broadcast_accounts"]
     if not broadcast_idx:
-        await call.answer(
-            "Нет аккаунтов, отмеченных для рассылки (раздел «👤 аккаунт»).", show_alert=True
-        )
+        await call.answer("Нет аккаунтов, отмеченных для рассылки (раздел «👤 аккаунт»).", show_alert=True)
         return
 
-    missing = []
+    missing_groups, missing_content = [], []
     for idx in broadcast_idx:
         acc = storage.get_account(user_id, idx)
-        if not acc or not acc["selected"]:
-            missing.append(acc["phone"] if acc else str(idx))
-    if missing:
-        await call.answer("Не настроена группа на номере — " + ", ".join(missing), show_alert=True)
+        if not acc:
+            continue
+        if not acc["selected"]:
+            missing_groups.append(acc["phone"])
+        if not acc["content_type"]:
+            missing_content.append(acc["phone"])
+    if missing_groups:
+        await call.answer("Не настроена группа на номере — " + ", ".join(missing_groups), show_alert=True)
+        return
+    if missing_content:
+        await call.answer("Не настроен контент на номере — " + ", ".join(missing_content), show_alert=True)
         return
 
-    if not user["content_type"]:
-        await call.answer("Сначала задайте контент рассылки", show_alert=True)
-        return
-
-    existing = running_tasks.get(user_id)
-    if existing and any(not t.done() for t in existing):
+    if _is_running(user_id):
         await call.answer("Рассылка уже запущена", show_alert=True)
         return
 
-    indices = broadcast_idx
-    delay_between_accounts = user.get("delay_between_accounts", 0) if len(indices) >= 2 else 0
+    _launch_tasks(user_id, broadcast_idx, call.bot)
 
-    tasks = []
-    for i, idx in enumerate(indices):
-        offset = i * delay_between_accounts
-        tasks.append(asyncio.create_task(_account_broadcast_loop(user_id, idx, offset, call.bot)))
-    running_tasks[user_id] = tasks
-
-    accounts_desc = ", ".join(storage.get_account(user_id, idx)["phone"] for idx in indices)
-    lines = [f"Рассылка запущена. Аккаунты ({len(indices)}): {accounts_desc}"]
-    if len(indices) >= 2 and delay_between_accounts:
-        lines.append(f"Пауза между стартом аккаунтов: {delay_between_accounts} сек.")
-    elif len(indices) >= 2:
-        lines.append("Все аккаунты стартуют одновременно.")
+    accounts_desc = ", ".join(storage.get_account(user_id, idx)["phone"] for idx in broadcast_idx)
+    lines = [f"Рассылка запущена. Аккаунты ({len(broadcast_idx)}): {accounts_desc}"]
+    if len(broadcast_idx) >= 2:
+        delay_between_accounts = user.get("delay_between_accounts", 0)
+        if delay_between_accounts:
+            lines.append(f"Пауза между стартом аккаунтов: {delay_between_accounts} сек.")
+        else:
+            lines.append("Все аккаунты стартуют одновременно.")
     await safe_edit_text(call.message, "\n".join(lines), reply_markup=kb.main_menu())
+
+
+@router.callback_query(F.data == "schedule_start")
+async def cb_schedule_start(call: CallbackQuery):
+    user_id = call.from_user.id
+    user = storage.get_user_data(user_id)
+
+    if not user.get("schedule_enabled") and _is_running(user_id):
+        await call.answer("Сначала выключите обычную рассылку (⏹ стоп).", show_alert=True)
+        return
+
+    if not user["schedule"]:
+        await call.answer('Сначала добавьте хотя бы одно время в "🗓 расписание".', show_alert=True)
+        return
+
+    broadcast_idx = user["broadcast_accounts"]
+    if not broadcast_idx:
+        await call.answer("Нет аккаунтов, отмеченных для рассылки (раздел «👤 аккаунт»).", show_alert=True)
+        return
+
+    missing_groups, missing_content = [], []
+    for idx in broadcast_idx:
+        acc = storage.get_account(user_id, idx)
+        if not acc:
+            continue
+        if not acc["selected"]:
+            missing_groups.append(acc["phone"])
+        if not acc["content_type"]:
+            missing_content.append(acc["phone"])
+    if missing_groups:
+        await call.answer("Не настроена группа на номере — " + ", ".join(missing_groups), show_alert=True)
+        return
+    if missing_content:
+        await call.answer("Не настроен контент на номере — " + ", ".join(missing_content), show_alert=True)
+        return
+
+    storage.update_user_data(user_id, schedule_enabled=True)
+
+    now = now_msk()
+    hhmm = now.strftime("%H:%M")
+    active_now = _schedule_active_now(user, now, hhmm)
+    if active_now and not _is_running(user_id):
+        indices = _eligible_broadcast_indices(user)
+        if indices:
+            _launch_tasks(user_id, indices, call.bot)
+
+    if active_now:
+        status_line = "Сейчас как раз внутри окна — рассылка уже идёт."
+    else:
+        status_line = f"Сейчас ({hhmm} МСК) вне заданных окон — запустится автоматически, когда время подойдёт."
+
+    await safe_edit_text(
+        call.message,
+        f"🕐 Рассылка по расписанию включена. {status_line}\n"
+        f"Время сверяется по МСК. Нажмите ⏹ стоп, чтобы выключить.",
+        reply_markup=kb.main_menu(),
+    )
 
 
 @router.callback_query(F.data == "broadcast_stop")
@@ -1111,65 +1466,61 @@ async def cb_broadcast_stop(call: CallbackQuery):
         stopped_anything = True
 
     if stopped_anything:
-        await safe_edit_text(call.message, "Рассылка/расписание остановлены.", reply_markup=kb.main_menu())
+        await safe_edit_text(call.message, "Рассылка остановлена.", reply_markup=kb.main_menu())
     else:
         await call.answer("Рассылка не запущена", show_alert=True)
 
 
-# ---------- Планировщик расписания ----------
+# ---------- Планировщик расписания (окна времени) ----------
 
-async def _run_scheduled_broadcast(user_id: int, bot: Bot):
-    user = storage.get_user_data(user_id)
-    indices = _eligible_broadcast_indices(user)
-    if not indices or not user["content_type"]:
-        return
-    delay_between_accounts = user.get("delay_between_accounts", 0) if len(indices) >= 2 else 0
-    for i, idx in enumerate(indices):
-        offset = i * delay_between_accounts
+async def scheduler_loop(bot: Bot):
+    while True:
+        now = now_msk()
+        hhmm = now.strftime("%H:%M")
 
-        async def _delayed(idx=idx, offset=offset):
-            if offset:
-                await asyncio.sleep(offset)
-            await _send_once_for_account(user_id, idx, bot)
+        for user_id in config.ALLOWED_USER_IDS:
+            user = storage.get_user_data(user_id)
+            if not user.get("schedule_enabled") or not user["schedule"]:
+                continue
 
-        asyncio.create_task(_delayed())
+            should_run = _schedule_active_now(user, now, hhmm)
+            currently_running = _is_running(user_id)
+
+            if should_run and not currently_running:
+                indices = _eligible_broadcast_indices(user)
+                if indices:
+                    _launch_tasks(user_id, indices, bot)
+            elif not should_run and currently_running:
+                for t in running_tasks.get(user_id, []):
+                    if not t.done():
+                        t.cancel()
+                running_tasks.pop(user_id, None)
+
+        await asyncio.sleep(config.SCHEDULER_CHECK_INTERVAL)
 
 
-# async def scheduler_loop(bot: Bot):
-#     fired: set[tuple[int, int, str]] = set()
-#     while True:
-#         now = datetime.now()
-#         hhmm = now.strftime("%H:%M")
-#         weekday = now.weekday()
-#         stamp = now.strftime("%Y-%m-%d %H:%M")
-#
-#         for user_id in config.ALLOWED_USER_IDS:
-#             user = storage.get_user_data(user_id)
-#             if not user.get("schedule_enabled"):
-#                 continue
-#             for entry in user["schedule"]:
-#                 if entry["time"] != hhmm:
-#                     continue
-#                 if entry["days"] and weekday not in entry["days"]:
-#                     continue
-#                 key = (user_id, entry["id"], stamp)
-#                 if key in fired:
-#                     continue
-#                 fired.add(key)
-#                 asyncio.create_task(_run_scheduled_broadcast(user_id, bot))
-#
-#         if len(fired) > 5000:
-#             cutoff = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
-#             fired = {k for k in fired if k[2] >= cutoff}
-#
-#         await asyncio.sleep(config.SCHEDULER_CHECK_INTERVAL)
+async def _startup_session_check(bot: Bot):
+    """При запуске бота проверяем все сохранённые аккаунты: если сессия была
+    отозвана вручную (через Устройства в Telegram), пока бот не работал —
+    сразу же чистим её, а не ждём первой попытки рассылки."""
+    for user_id in config.ALLOWED_USER_IDS:
+        user = storage.get_user_data(user_id)
+        for acc in list(user["accounts"]):
+            key = storage.session_key(user_id, acc["index"])
+            try:
+                ok = await ub.is_authorized(key)
+            except Exception:
+                ok = False
+            if not ok:
+                await _handle_dead_session(user_id, acc["index"], bot)
 
 
 async def main():
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    #asyncio.create_task(scheduler_loop(bot))
+    await _startup_session_check(bot)
+    asyncio.create_task(scheduler_loop(bot))
     logger.info("Бот запущен...")
     await dp.start_polling(bot)
 
