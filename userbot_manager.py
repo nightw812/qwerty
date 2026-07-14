@@ -8,12 +8,22 @@
 import os
 import asyncio
 import random
+import logging
 
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat
+from telethon.errors import (
+    FloodWaitError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+)
 
 import config
-import spintax
+import spintext
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 _clients: dict[str, TelegramClient] = {}
 
@@ -130,37 +140,31 @@ def _can_post(entity) -> bool:
 async def fetch_groups(session_key: str) -> list[dict]:
     """
     Возвращает список групп/каналов, где состоит данный аккаунт И где у него
-    есть право отправлять сообщения (каналы/группы без права постить пропускаются).
+    есть право отправлять сообщения. Максимум config.MAX_GROUPS_PER_ACCOUNT.
     """
     client = await get_client(session_key)
     groups = []
-    async for dialog in client.iter_dialogs():
-        if not (dialog.is_group or dialog.is_channel):
-            continue
-        if not _can_post(dialog.entity):
-            continue
-        groups.append({"id": dialog.id, "name": dialog.name})
+    try:
+        async for dialog in client.iter_dialogs():
+            if not (dialog.is_group or dialog.is_channel):
+                continue
+            if not _can_post(dialog.entity):
+                continue
+            groups.append({"id": dialog.id, "name": dialog.name})
+            # Ограничиваем количество групп
+            if len(groups) >= config.MAX_GROUPS_PER_ACCOUNT:
+                break
+    except FloodWaitError as e:
+        logger.warning(f"FloodWait при загрузке групп: {e.seconds} сек.")
+        await asyncio.sleep(e.seconds)
+        # Повторяем попытку
+        return await fetch_groups(session_key)
+    except Exception as e:
+        logger.error(f"Ошибка загрузки групп: {e}")
     return groups
 
 
 async def broadcast(session_key: str, chat_ids: list[int], content: dict, delay_spec: dict):
-    """
-    Рассылает контент только в группы из chat_ids (аккаунт должен уже там состоять).
-
-    content = {
-        "type": "text" | "photo" | "photo_text" | "forward",
-        "text": str | None,                 # может содержать спинтакс {a|b} и HTML-разметку
-        "photo": путь к файлу изображения | None,
-        "forward_chat_id": int | None,       # для "forward"
-        "forward_message_id": int | None,    # для "forward"
-    }
-    Текст резолвится ЗАНОВО перед каждой отправкой (спинтакс), чтобы сообщения
-    в разных группах отличались.
-
-    delay_spec = {"min": float, "max": float} — пауза между отправками, секунды.
-    Если min == max — пауза фиксированная, иначе каждая пауза выбирается случайно
-    в этом диапазоне (с точностью до сотых секунды).
-    """
     client = await get_client(session_key)
     content_type = content.get("type")
     text_template = content.get("text")
@@ -174,25 +178,109 @@ async def broadcast(session_key: str, chat_ids: list[int], content: dict, delay_
         lo, hi = hi, lo
 
     sent, failed = 0, 0
+
     for chat_id in chat_ids:
         try:
             if content_type == "text":
-                text = spintax.resolve(text_template)
+                text = spintext.resolve(text_template) if text_template else ""
                 await client.send_message(chat_id, text, parse_mode="html")
+
             elif content_type == "photo":
                 await client.send_file(chat_id, photo)
+
             elif content_type == "photo_text":
-                text = spintax.resolve(text_template)
+                text = spintext.resolve(text_template) if text_template else ""
                 await client.send_file(chat_id, photo, caption=text, parse_mode="html")
+
             elif content_type == "forward":
-                await client.forward_messages(chat_id, fwd_msg, from_peer=fwd_chat)
+                # Пытаемся переслать
+                try:
+                    await client.forward_messages(chat_id, fwd_msg, from_peer=fwd_chat)
+                except Exception as e:
+                    logger.error(f"Ошибка forward_messages: {e}. Пробуем скопировать содержимое.")
+                    # Fallback: если не удалось переслать, пытаемся получить исходное сообщение и отправить как новое
+                    # Для этого нужно получить сообщение по fwd_chat и fwd_msg
+                    try:
+                        original_msg = await client.get_messages(fwd_chat, ids=fwd_msg)
+                        if original_msg:
+                            if original_msg.text:
+                                await client.send_message(chat_id, original_msg.text, parse_mode="html")
+                            elif original_msg.photo:
+                                # Скачиваем фото и отправляем
+                                file_path = await client.download_media(original_msg.photo)
+                                if file_path:
+                                    await client.send_file(chat_id, file_path, caption=original_msg.caption)
+                                    # удаляем временный файл
+                                    try:
+                                        os.remove(file_path)
+                                    except:
+                                        pass
+                            else:
+                                # Другие типы медиа можно добавить
+                                logger.warning(f"Не поддерживаемый тип медиа в сообщении {fwd_msg}")
+                                failed += 1
+                                continue
+                        else:
+                            logger.error(f"Не удалось получить сообщение {fwd_msg} из {fwd_chat}")
+                            failed += 1
+                            continue
+                    except Exception as e2:
+                        logger.error(f"Ошибка при получении сообщения: {e2}")
+                        failed += 1
+                        continue
+
             else:
+                logger.warning(f"Неизвестный тип контента: {content_type}")
                 failed += 1
                 continue
+
             sent += 1
-        except Exception:
+            logger.info(f"Отправлено в {chat_id} (акк {session_key})")
+
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait на {chat_id}: {e.seconds} сек.")
+            await asyncio.sleep(e.seconds)
+            # Пробуем повторно отправить (упрощённо)
+            try:
+                # Повторяем ту же логику с повторной попыткой (можно вынести в функцию)
+                if content_type == "forward":
+                    try:
+                        await client.forward_messages(chat_id, fwd_msg, from_peer=fwd_chat)
+                    except Exception as e:
+                        # fallback
+                        original_msg = await client.get_messages(fwd_chat, ids=fwd_msg)
+                        if original_msg:
+                            if original_msg.text:
+                                await client.send_message(chat_id, original_msg.text, parse_mode="html")
+                            elif original_msg.photo:
+                                file_path = await client.download_media(original_msg.photo)
+                                if file_path:
+                                    await client.send_file(chat_id, file_path, caption=original_msg.caption)
+                                    try:
+                                        os.remove(file_path)
+                                    except:
+                                        pass
+                # ... аналогично для других типов
+                sent += 1
+            except Exception as e2:
+                logger.error(f"Ошибка повторной отправки: {e2}")
+                failed += 1
+
+        except Exception as e:
+            logger.error(f"Ошибка отправки в {chat_id}: {e}")
             failed += 1
+
+        # Пауза между отправками
         pause = round(random.uniform(lo, hi), 2) if hi > lo else lo
         if pause > 0:
             await asyncio.sleep(pause)
+
+    logger.info(f"Рассылка завершена: {sent} отправлено, {failed} ошибок")
     return sent, failed
+
+def _cleanup_temp_photo(path: str):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
