@@ -1,5 +1,45 @@
 import json
 import os
+from datetime import datetime
+
+"""
+JSON-хранилище на пользователя + отдельный глобальный реестр номеров телефонов.
+
+Структура user-записи:
+{
+  "accounts": [
+      {
+        "index": int,
+        "phone": str,
+        "groups": [{"id":.., "name":..}],
+        "selected": [id, ...],
+        "interval": int | None,      # секунды повтора; None/0 = отправка один раз
+        "delay": {"min": float, "max": float},  # случайная пауза между сообщениями, сек.
+        "content_type": "text" | "photo" | "photo_text" | "forward" | None,
+        "content_text": str | None,
+        "content_photo": str | None,           # путь к файлу на диске
+        "content_forward_chat_id": int | None, # источник для пересылки
+        "content_forward_message_id": int | None,
+        "stat_sent": int,             # сколько сообщений успешно отправлено (всего)
+        "stat_errors": int,           # сколько ошибок при отправке (всего)
+      },
+      ...
+  ],
+  "broadcast_accounts": [int, ...],   # какие аккаунты реально рассылают (галочки в "аккаунт")
+  "delay_between_accounts": float,    # пауза между стартом рассылки у разных аккаунтов, сек.
+  "settings_account": int | None,     # какой номер сейчас открыт в разделе "настройка"
+  "groups_account": int | None,       # какой номер сейчас открыт в разделе "группы"
+  "content_account": int | None,      # какой номер сейчас открыт в разделе "контент"
+  "schedule": [{"id": int, "days": [0-6] (пусто = каждый день), "start": "HH:MM", "end": "HH:MM"}],
+  "schedule_enabled": bool,
+}
+
+Отдельно, в PHONES_FILE, хранится глобальный реестр номеров вида:
+{ "+79991234567": {"user_id": 111, "account_index": 0}, ... }
+"""
+
+import json
+import os
 from threading import Lock
 
 import config
@@ -57,19 +97,7 @@ def get_user_data(user_id: int) -> dict:
         acc.setdefault("delay", dict(_DEFAULT_DELAY))
         for k, v in _DEFAULT_ACCOUNT_EXTRA.items():
             acc.setdefault(k, v)
-        # === ДОБАВЛЯЕМ МИГРАЦИЮ ДЛЯ INTERVAL ===
-        if acc["interval"] is not None:
-            # Если interval это int, преобразуем в dict
-            if isinstance(acc["interval"], int):
-                val = acc["interval"]
-                acc["interval"] = {"min": val, "max": val}
-            # Если это dict, проверяем ключи
-            elif isinstance(acc["interval"], dict):
-                if "min" not in acc["interval"]:
-                    acc["interval"]["min"] = acc["interval"].get("max", 0)
-                if "max" not in acc["interval"]:
-                    acc["interval"]["max"] = acc["interval"].get("min", 0)
-    # ... остальной код ...
+        # миграция старых записей расписания (time -> start/end)
     user.setdefault("broadcast_accounts", [])
     user.setdefault("delay_between_accounts", 0)
     user.setdefault("settings_account", None)
@@ -79,6 +107,7 @@ def get_user_data(user_id: int) -> dict:
     user.setdefault("schedule_enabled", False)
     for entry in user["schedule"]:
         if "start" not in entry:
+            # миграция старого формата {"time": "HH:MM"} -> окно того же времени
             t = entry.pop("time", "00:00")
             entry["start"] = t
             entry["end"] = t
@@ -92,14 +121,6 @@ def get_user_data(user_id: int) -> dict:
         user["groups_account"] = next(iter(existing), None)
     if user["content_account"] not in existing:
         user["content_account"] = next(iter(existing), None)
-
-    # Ограничиваем количество групп до MAX_GROUPS_PER_ACCOUNT
-    for acc in user["accounts"]:
-        if len(acc.get("groups", [])) > config.MAX_GROUPS_PER_ACCOUNT:
-            acc["groups"] = acc["groups"][:config.MAX_GROUPS_PER_ACCOUNT]
-        if len(acc.get("selected", [])) > config.MAX_GROUPS_PER_ACCOUNT:
-            acc["selected"] = acc["selected"][:config.MAX_GROUPS_PER_ACCOUNT]
-
     return user
 
 
@@ -127,11 +148,10 @@ def next_account_index(user_id: int) -> int:
 
 def add_account(user_id: int, index: int, phone: str):
     user = get_user_data(user_id)
-
-    # Проверка на максимальное количество аккаунтов
+    # Проверка лимита аккаунтов
     if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
-        raise ValueError(f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунтов на пользователя")
-
+        raise ValueError(f"Максимум {config.MAX_ACCOUNTS_PER_USER} аккаунта на пользователя")
+    
     acc = {
         "index": index,
         "phone": phone,
@@ -216,7 +236,7 @@ def session_key(user_id: int, account_index: int) -> str:
     return f"{user_id}_{account_index}"
 
 
-# ---------- реестр телефонных номеров ----------
+# ---------- реестр телефонных номеров (глобальный, across всех пользователей бота) ----------
 
 def _load_phones():
     if not os.path.exists(config.PHONES_FILE):
@@ -250,7 +270,7 @@ def unregister_phone(phone: str):
         _save_phones(data)
 
 
-# ---------- расписание ----------
+# ---------- расписание (окна времени: начало-конец) ----------
 
 def next_schedule_id(user_id: int) -> int:
     user = get_user_data(user_id)
@@ -276,3 +296,149 @@ def remove_schedule_entry(user_id: int, entry_id: int):
 def all_user_ids_with_data() -> list[int]:
     data = _load()
     return [int(uid) for uid in data.keys()]
+
+
+# ---------- глобальная статистика бота (админ-панель) ----------
+
+def _load_stats() -> dict:
+    stats_file = getattr(config, "STATS_FILE", "data/stats.json")
+    if not os.path.exists(stats_file):
+        return {}
+    with open(stats_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_stats(data: dict):
+    stats_file = getattr(config, "STATS_FILE", "data/stats.json")
+    os.makedirs(os.path.dirname(stats_file), exist_ok=True)
+    with open(stats_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _default_stats() -> dict:
+    return {
+        "started_users": {},
+        "maintenance_mode": False,
+        "function_usage": {
+            "schedule_start": 0,  # Рассылка по времени
+            "content_text": 0,    # Контент - текст
+            "content_photo": 0,   # Контент - фото
+            "content_photo_text": 0,  # Контент - фото+текст
+            "interval_fixed": 0,  # Интервал - обычный
+            "interval_random": 0,  # Интервал - рандом
+            "delay_fixed": 0,     # Пауза между группами - обычная
+            "delay_random": 0,    # Пауза между группами - рандом
+        },
+        "accounts_distribution": {
+            "1_account": 0,
+            "2_accounts": 0,
+            "3_accounts": 0,
+        }
+    }
+
+
+def get_stats() -> dict:
+    stats = _default_stats()
+    stats.update(_load_stats())
+    stats.setdefault("started_users", {})
+    stats.setdefault("maintenance_mode", False)
+    return stats
+
+
+def mark_user_started(user_id: int) -> bool:
+    """Фиксирует первый /start. Возвращает True, если пользователь новый."""
+    with _lock:
+        stats = get_stats()
+        uid = str(user_id)
+        if uid in stats["started_users"]:
+            return False
+        stats["started_users"][uid] = datetime.now().isoformat()
+        _save_stats(stats)
+        return True
+
+
+def count_new_users(period: str) -> int:
+    from datetime import datetime, timedelta
+    stats = get_stats()
+    now = datetime.now()
+    count = 0
+    for ts_str in stats["started_users"].values():
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if period == "day":
+            if ts.date() == now.date():
+                count += 1
+        elif period == "week":
+            if ts >= now - timedelta(days=7):
+                count += 1
+        elif period == "month":
+            if ts >= now - timedelta(days=30):
+                count += 1
+        elif period == "all":
+            count += 1
+    return count
+
+
+def is_maintenance_mode() -> bool:
+    return get_stats().get("maintenance_mode", False)
+
+
+def set_maintenance_mode(enabled: bool):
+    with _lock:
+        stats = get_stats()
+        stats["maintenance_mode"] = enabled
+        _save_stats(stats)
+
+
+def increment_function_usage(function_name: str):
+    """Увеличивает счётчик использования функции."""
+    with _lock:
+        stats = get_stats()
+        if "function_usage" not in stats:
+            stats["function_usage"] = {}
+        stats["function_usage"][function_name] = stats["function_usage"].get(function_name, 0) + 1
+        _save_stats(stats)
+
+
+def update_accounts_distribution():
+    """Обновляет распределение пользователей по количеству аккаунтов."""
+    with _lock:
+        stats = get_stats()
+        if "accounts_distribution" not in stats:
+            stats["accounts_distribution"] = {"1_account": 0, "2_accounts": 0, "3_accounts": 0}
+        
+        # Сбрасываем счётчики
+        stats["accounts_distribution"] = {"1_account": 0, "2_accounts": 0, "3_accounts": 0}
+        
+        # Подсчитываем распределение
+        data = _load()
+        for user_data in data.values():
+            account_count = len(user_data.get("accounts", []))
+            if account_count == 1:
+                stats["accounts_distribution"]["1_account"] += 1
+            elif account_count == 2:
+                stats["accounts_distribution"]["2_accounts"] += 1
+            elif account_count == 3:
+                stats["accounts_distribution"]["3_accounts"] += 1
+        
+        _save_stats(stats)
+
+
+def get_function_usage_stats() -> dict:
+    """Возвращает статистику использования функций."""
+    stats = get_stats()
+    return stats.get("function_usage", {})
+
+
+def get_accounts_distribution() -> dict:
+    """Возвращает распределение пользователей по количеству аккаунтов."""
+    stats = get_stats()
+    return stats.get("accounts_distribution", {"1_account": 0, "2_accounts": 0, "3_accounts": 0})
+
+
+def all_bot_user_ids() -> list[int]:
+    """Все пользователи, которые хотя бы раз нажали /start."""
+    stats = get_stats()
+    return [int(uid) for uid in stats["started_users"].keys()]
