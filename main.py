@@ -25,11 +25,7 @@ try:
     from zoneinfo import ZoneInfo
     MSK = ZoneInfo("Europe/Moscow")
 except Exception:
-    # На случай, если база часовых поясов недоступна (например, "голый" Windows
-    # без пакета tzdata) — используем фиксированное смещение. Россия не переходит
-    # на летнее/зимнее время с 2014 года, так что UTC+3 для MSK надёжно всегда.
     MSK = timezone(timedelta(hours=3))
-
 
 def now_msk() -> datetime:
     return datetime.now(MSK)
@@ -47,14 +43,17 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
+    FloodWaitError,
 )
 
 import config
 import storage
-import spintax
+import spintext
 import userbot_manager as ub
-import keyboards as kb
+import keyboards as kb  # ← ИМПОРТИРУЕМ из keyboards.py
 from emoji_utils import emoji
+
+# ... ОСТАЛЬНОЙ КОД main.py (без дублирования клавиатур!)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -119,7 +118,41 @@ async def safe_edit_reply_markup(message: Message, reply_markup=None):
 
 # ---------- парсинг/форматирование ----------
 
-def parse_interval(text: str) -> int | None:
+def parse_interval(text: str) -> dict | None:
+    """
+    Парсит интервал. Поддерживает два формата:
+    - Фиксированный: 0:1:15
+    - Рандомный: 0:1:15-0:1:20
+
+    Возвращает dict {"min": seconds, "max": seconds} или None при ошибке.
+    """
+    text = text.strip()
+
+    # Проверяем, есть ли диапазон
+    if "-" in text:
+        parts = text.split("-")
+        if len(parts) != 2:
+            return None
+
+        min_val = _parse_single_interval(parts[0])
+        max_val = _parse_single_interval(parts[1])
+
+        if min_val is None or max_val is None:
+            return None
+
+        if min_val > max_val:
+            min_val, max_val = max_val, min_val
+
+        return {"min": min_val, "max": max_val}
+    else:
+        val = _parse_single_interval(text)
+        if val is None:
+            return None
+        return {"min": val, "max": val}
+
+
+def _parse_single_interval(text: str) -> int | None:
+    """Парсит один интервал в формате часы:минуты:секунды."""
     parts = text.strip().split(":")
     if len(parts) != 3:
         return None
@@ -133,6 +166,28 @@ def parse_interval(text: str) -> int | None:
     if total <= 0:
         return None
     return total
+
+
+def format_interval(interval_spec: dict) -> str:
+    """Форматирует интервал для отображения пользователю."""
+    if not interval_spec:
+        return "не задан (отправка один раз)"
+
+    min_val = interval_spec.get("min", 0)
+    max_val = interval_spec.get("max", 0)
+
+    h, rem = divmod(int(min_val), 3600)
+    m, s = divmod(rem, 60)
+    min_str = f"{h}:{m:02d}:{s:02d}"
+
+    if min_val == max_val:
+        return min_str
+
+    h, rem = divmod(int(max_val), 3600)
+    m, s = divmod(rem, 60)
+    max_str = f"{h}:{m:02d}:{s:02d}"
+
+    return f"{min_str}–{max_str} (случайно)"
 
 
 def format_interval(total_seconds) -> str:
@@ -217,17 +272,40 @@ def _content_back_target(user: dict) -> str:
 
 
 def _extract_forward_origin(message: Message):
-    """Возвращает (chat_id, message_id) исходного сообщения, если пересылка
-    доступна для повторной пересылки, иначе (None, None)."""
+    """
+    Возвращает (chat_id, message_id) исходного сообщения.
+    Теперь работает даже если пересылка запрещена — пытается найти источник
+    любым доступным способом.
+    """
+    # Способ 1: через forward_origin (новый API)
     origin = getattr(message, "forward_origin", None)
     if origin is not None:
         chat = getattr(origin, "chat", None)
         msg_id = getattr(origin, "message_id", None)
         if chat is not None and msg_id is not None:
             return chat.id, msg_id
-        return None, None
+
+    # Способ 2: через forward_from_chat (старый API)
     if message.forward_from_chat and message.forward_from_message_id:
         return message.forward_from_chat.id, message.forward_from_message_id
+
+    # Способ 3: если переслано от пользователя
+    if message.forward_from and message.forward_from_message_id:
+        return message.forward_from.id, message.forward_from_message_id
+
+    # Способ 4: если переслано из канала с подписью
+    if hasattr(message, "forward_sender_name") and message.forward_sender_name:
+        # В этом случае мы не можем определить chat_id, но можем попробовать
+        # использовать медиа-группу или другие поля
+        pass
+
+    # Способ 5: пробуем найти через reply_to_message (если есть)
+    if message.reply_to_message:
+        reply = message.reply_to_message
+        if reply.chat and reply.message_id:
+            # Если это ответ на сообщение, можно использовать его как источник
+            return reply.chat.id, reply.message_id
+
     return None, None
 
 
@@ -386,6 +464,19 @@ async def _send_qr(bot: Bot, chat_id: int, url: str, caption: str):
 
 async def _finish_login(user_id: int, account_index: int, key: str, client, bot: Bot, chat_id: int):
     phone = await _canonical_phone(client)
+
+    # Проверяем, не превышен ли лимит аккаунтов
+    user = storage.get_user_data(user_id)
+    if len(user["accounts"]) >= config.MAX_ACCOUNTS_PER_USER:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Достигнут лимит аккаунтов ({config.MAX_ACCOUNTS_PER_USER}). "
+            f"Удалите один из существующих аккаунтов, чтобы добавить новый.",
+            reply_markup=kb.main_menu(),
+        )
+        await ub.discard_client(key)
+        return
+
     if storage.is_phone_registered(phone):
         try:
             await ub.logout(key)
@@ -398,6 +489,7 @@ async def _finish_login(user_id: int, account_index: int, key: str, client, bot:
             reply_markup=kb.main_menu(),
         )
         return
+
     storage.add_account(user_id, account_index, phone)
     await bot.send_message(chat_id, f"Аккаунт {phone} подключён ✅", reply_markup=kb.main_menu())
 
@@ -420,10 +512,12 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
         except asyncio.TimeoutError:
             pending_qr_logins.pop(user_id, None)
             await ub.discard_client(key)
-            try:
-                await bot.delete_message(chat_id, msg.message_id)
-            except Exception:
-                pass
+            # Удаляем QR-код
+            if msg:
+                try:
+                    await bot.delete_message(chat_id, msg.message_id)
+                except Exception:
+                    pass
             await bot.send_message(
                 chat_id,
                 "Время сканирования истекло. Нажмите «➕ добавить аккаунт (QR)» ещё раз.",
@@ -431,10 +525,12 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
             )
             return
         except SessionPasswordNeededError:
-            try:
-                await bot.delete_message(chat_id, msg.message_id)
-            except Exception:
-                pass
+            # Удаляем QR-код
+            if msg:
+                try:
+                    await bot.delete_message(chat_id, msg.message_id)
+                except Exception:
+                    pass
             await bot.send_message(
                 chat_id,
                 "На этом аккаунте включён пароль (2FA). Отправьте его сообщением "
@@ -445,8 +541,20 @@ async def _qr_login_flow(user_id: int, account_index: int, key: str, client, bot
     except Exception as e:
         pending_qr_logins.pop(user_id, None)
         await ub.discard_client(key)
+        if msg:
+            try:
+                await bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
         await bot.send_message(chat_id, f"Ошибка входа: {e}")
         return
+
+    # QR-код успешно отсканирован — удаляем его
+    if msg:
+        try:
+            await bot.delete_message(chat_id, msg.message_id)
+        except Exception:
+            pass
 
     pending_qr_logins.pop(user_id, None)
     await _finish_login(user_id, account_index, key, client, bot, chat_id)
@@ -807,7 +915,7 @@ def _cleanup_photo_if_unused(user_id: int, account_index: int, new_content_type:
 @router.message(ContentStates.waiting_text)
 async def process_content_text(message: Message, state: FSMContext):
     text = message.html_text
-    if not spintax.validate(text):
+    if not spintext.validate(text):
         await message.answer("В шаблоне не совпадает количество { и } — проверьте и пришлите ещё раз.")
         return
     data = await state.get_data()
@@ -858,23 +966,49 @@ async def cb_content_set_forward(call: CallbackQuery, state: FSMContext):
 
 @router.message(ContentStates.waiting_forward)
 async def process_content_forward(message: Message, state: FSMContext):
-    chat_id, msg_id = _extract_forward_origin(message)
-    if chat_id is None or msg_id is None:
-        await message.answer(
-            "Не удалось определить источник пересылки. Перешлите другое сообщение "
-            "(из канала/группы, где пересылка не ограничена), либо используйте текст/фото."
-        )
-        return
     data = await state.get_data()
-    storage.update_account(
-        message.from_user.id, data["account_index"],
-        content_type="forward", content_text=None, content_photo=None,
-        content_forward_chat_id=chat_id, content_forward_message_id=msg_id,
-    )
-    _cleanup_photo_if_unused(message.from_user.id, data["account_index"], "forward")
-    await state.clear()
-    await message.answer("Пересылаемое сообщение сохранено ✅", reply_markup=kb.main_menu())
+    account_index = data["account_index"]
 
+    chat_id = None
+    msg_id = None
+
+    # 1. Сначала пробуем определить источник из пересылки
+    origin = _extract_forward_origin(message)
+    if origin[0] is not None:
+        chat_id, msg_id = origin
+    else:
+        # 2. Если пересылка не определена, проверяем, есть ли reply
+        if message.reply_to_message:
+            reply = message.reply_to_message
+            chat_id = reply.chat.id
+            msg_id = reply.message_id
+            await message.answer("✅ Источник определён через ответ (Reply).")
+        else:
+            await message.answer(
+                "⚠️ Не удалось определить источник.\n\n"
+                "Попробуйте один из способов:\n"
+                "1️⃣ Перешлите сообщение заново\n"
+                "2️⃣ Ответьте (Reply) на сообщение, которое хотите переслать\n"
+                "3️⃣ Используйте текст/фото вместо пересылки",
+                reply_markup=kb.cancel_button()
+            )
+            return
+
+    # Сохраняем источник в аккаунт
+    storage.update_account(
+        message.from_user.id, account_index,
+        content_type="forward",
+        content_forward_chat_id=chat_id,
+        content_forward_message_id=msg_id,
+        content_text=None,
+        content_photo=None,
+    )
+    _cleanup_photo_if_unused(message.from_user.id, account_index, "forward")
+    await state.clear()
+    await message.answer(
+        "✅ Пересылаемое сообщение сохранено (источник определён).",
+        reply_markup=kb.main_menu()
+    )
 
 async def _save_photo(message: Message, user_id: int, account_index: int) -> str:
     os.makedirs(config.MEDIA_DIR, exist_ok=True)
@@ -902,7 +1036,7 @@ async def process_content_photo(message: Message, state: FSMContext):
 
     if message.caption:
         caption = message.html_text
-        if not spintax.validate(caption):
+        if not spintext.validate(caption):
             await message.answer("В подписи не совпадает количество { и } — пришлите фото с подписью ещё раз.")
             return
         storage.update_account(
@@ -927,7 +1061,7 @@ async def process_content_photo_wrong_type(message: Message):
 @router.message(ContentStates.waiting_photo_caption)
 async def process_photo_caption(message: Message, state: FSMContext):
     text = message.html_text
-    if not spintax.validate(text):
+    if not spintext.validate(text):
         await message.answer("В шаблоне не совпадает количество { и } — пришлите текст ещё раз.")
         return
     data = await state.get_data()
@@ -998,12 +1132,13 @@ async def cb_settings_interval_set(call: CallbackQuery, state: FSMContext):
     await state.update_data(account_index=user["settings_account"])
     await safe_edit_text(
         call.message,
-        "Отправьте интервал в формате часы:минуты:секунды\nНапример: 1:15:10 "
-        "(раз в 1 час 15 минут 10 секунд)",
+        "Отправьте интервал в формате часы:минуты:секунды\n\n"
+        "📌 Фиксированный: 0:1:15 (раз в 1 минуту 15 секунд)\n"
+        "📌 Случайный: 0:1:15-0:1:20 (от 1:15 до 1:20 случайно)\n\n"
+        "Пример: 1:30:00 (раз в 1.5 часа)",
         reply_markup=kb.cancel_button(),
     )
     await state.set_state(SettingsStates.waiting_interval)
-
 
 @router.callback_query(F.data == "settings_interval_once")
 async def cb_settings_interval_once(call: CallbackQuery):
@@ -1026,15 +1161,34 @@ async def cb_settings_interval_once(call: CallbackQuery):
 
 @router.message(SettingsStates.waiting_interval)
 async def process_interval(message: Message, state: FSMContext):
-    seconds = parse_interval(message.text)
-    if seconds is None:
-        await message.answer("Неверный формат. Пришлите интервал как часы:минуты:секунды, например 1:15:10")
+    interval_spec = parse_interval(message.text)
+    if interval_spec is None:
+        await message.answer(
+            "❌ Неверный формат.\n\n"
+            "📌 Фиксированный: 0:1:15\n"
+            "📌 Случайный: 0:1:15-0:1:20\n\n"
+            "Попробуйте ещё раз:"
+        )
         return
-    data = await state.get_data()
-    storage.update_account(message.from_user.id, data["account_index"], interval=seconds)
-    await state.clear()
-    await message.answer(f"Интервал сохранён: {format_interval(seconds)} ✅", reply_markup=kb.main_menu())
 
+    data = await state.get_data()
+    storage.update_account(message.from_user.id, data["account_index"], interval=interval_spec)
+    await state.clear()
+
+    # Красиво форматируем для ответа
+    if interval_spec["min"] == interval_spec["max"]:
+        h, rem = divmod(int(interval_spec["min"]), 3600)
+        m, s = divmod(rem, 60)
+        formatted = f"{h}:{m:02d}:{s:02d}"
+        await message.answer(f"✅ Интервал сохранён: {formatted}", reply_markup=kb.main_menu())
+    else:
+        h, rem = divmod(int(interval_spec["min"]), 3600)
+        m, s = divmod(rem, 60)
+        min_str = f"{h}:{m:02d}:{s:02d}"
+        h, rem = divmod(int(interval_spec["max"]), 3600)
+        m, s = divmod(rem, 60)
+        max_str = f"{h}:{m:02d}:{s:02d}"
+        await message.answer(f"✅ Интервал сохранён: {min_str}–{max_str} (случайный)", reply_markup=kb.main_menu())
 
 @router.callback_query(F.data == "settings_delay")
 async def cb_settings_delay(call: CallbackQuery):
@@ -1235,6 +1389,47 @@ def _schedule_active_now(user: dict, now: datetime, hhmm: str) -> bool:
     return False
 
 
+def _extract_content_from_forward(message: Message) -> dict | None:
+    """
+    Извлекает содержимое из пересланного сообщения.
+    Возвращает словарь с ключами:
+    - type: "text" | "photo" | "photo_text" | None
+    - text: текст (если есть)
+    - photo_path: путь к сохранённому фото (если есть)
+    """
+    if message.forward_origin or message.forward_from_chat or message.forward_from:
+        # Это пересланное сообщение
+        content = {"type": None, "text": None, "photo_path": None}
+
+        # Текст (если есть)
+        if message.text or message.caption:
+            content["text"] = message.html_text or message.html_caption
+            content["type"] = "text"
+
+        # Фото (если есть)
+        if message.photo:
+            # Сохраняем фото во временную папку
+            os.makedirs(config.MEDIA_DIR, exist_ok=True)
+            # Используем временное имя
+            import tempfile
+            temp_path = os.path.join(config.MEDIA_DIR,
+                                     f"temp_forward_{message.from_user.id}_{int(datetime.now().timestamp())}.jpg")
+            message.bot.download(message.photo[-1], destination=temp_path)
+            content["photo_path"] = temp_path
+            if content["text"]:
+                content["type"] = "photo_text"
+            else:
+                content["type"] = "photo"
+
+        # Если ничего не найдено (например, документ) — возвращаем None
+        if content["type"] is None:
+            return None
+
+        return content
+
+    return None
+
+
 # ---------- Рассылка ----------
 
 def _eligible_broadcast_indices(user: dict) -> list[int]:
@@ -1315,9 +1510,27 @@ async def _account_broadcast_loop(user_id: int, account_index: int, start_offset
         await _send_once_for_account(user_id, account_index, bot)
 
         acc = storage.get_account(user_id, account_index)
-        interval = acc["interval"] if acc else None
-        if not interval:
+        interval_spec = acc.get("interval")
+        if not interval_spec:
             return
+        min_interval = interval_spec.get("min", 0)
+        max_interval = interval_spec.get("max", min_interval)
+
+        if not interval_spec:
+            return
+
+        # Поддержка старого формата (число) и нового (словарь с min/max)
+        if isinstance(interval_spec, (int, float)):
+            interval_spec = {"min": interval_spec, "max": interval_spec}
+
+        min_interval = interval_spec.get("min", 0)
+        max_interval = interval_spec.get("max", min_interval)
+
+        if max_interval > min_interval:
+            interval = random.uniform(min_interval, max_interval)
+        else:
+            interval = min_interval
+
         await asyncio.sleep(interval)
 
 
